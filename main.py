@@ -1,17 +1,29 @@
-import requests
-import time
 import json
+import sys
+import time
 from datetime import datetime, date
+from pathlib import Path
+import requests
 from playsound import playsound
+
+app_dir = Path(
+    sys.executable if getattr(sys, "frozen", False) else __file__
+).resolve().parent
+
+config_path = app_dir / "config.json"
+alarm_path = app_dir / "alarm.mp3"
+default_region = "Одеська область"
+alerts_url = "https://ubilling.net.ua/aerialalerts/"
 
 def load_config():
     try:
-        with open('config.json') as file:
+        with config_path.open(encoding="utf-8-sig") as file:
             config = json.load(file)
     except FileNotFoundError:
         config = {}
     except json.JSONDecodeError:
         raise SystemExit("Not valid JSON")
+
     if not isinstance(config, dict):
         raise SystemExit("JSON has an unexpected format.")
     if not isinstance(config.get("response"), dict):
@@ -20,8 +32,8 @@ def load_config():
 
 
 def save_user_config(config):
-    with open('config.json', "w") as file:
-        json.dump(config, file, indent=4)
+    with config_path.open("w", encoding="utf-8") as file:
+        json.dump(config, file, indent=4, ensure_ascii=False)
     return config
 
 
@@ -83,10 +95,18 @@ def get_today_schedule(config):
             print("Schedule saved successfully")
             return wake_time, late_wake_time, border_time
         else:
-            print("Error. The boundary (B) must be later than the rise (W) and earlier than the late rise (L)")
+            print(
+                "Error. The boundary (B) must be later than the rise (W) "
+                "and earlier than the late rise (L)"
+            )
             print("Try again")
 
-day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+
+day_names = [
+    "Monday", "Tuesday", "Wednesday", "Thursday",
+    "Friday", "Saturday", "Sunday",
+]
+
 
 def remove_day(config):
     key = input("Enter day to remove (0-6): ").strip()
@@ -95,6 +115,7 @@ def remove_day(config):
     else:
         print("There was no schedule for that day.")
         return
+
     save_user_config(config)
     print(f"{day_names[int(key)]} is now a day off.")
 
@@ -116,7 +137,7 @@ def show_schedule(config):
 def ring():
     print("🔔 Time to wake up! 🔔")
     try:
-        playsound('alarm.mp3')
+        playsound(str(alarm_path))
     except Exception as e:
         print(f"Failed to enable sound: {e}")
     time.sleep(0.2)
@@ -136,7 +157,6 @@ def alarm_status(w_time, b_time, l_time, alert_now, time_now):
 
 def run_alarm(config):
     current_day_str = str(datetime.now().weekday())
-
     day_schedule = config.get("response", {}).get(current_day_str)
 
     if not day_schedule:
@@ -148,23 +168,24 @@ def run_alarm(config):
     l_time = datetime.strptime(day_schedule["L"], "%H:%M").time()
 
     today_str = date.today().isoformat()
-    if config.get('last_ring_date') == today_str:
+    if config.get("last_ring_date") == today_str:
         print("Alarm already went off today.")
         return
 
-    print(f"Alarm started for today! Waiting for time to ring... Press Ctrl+C to stop")
+    region = config.get("region", default_region)
+    print("Alarm started for today! Waiting for time to ring... Press Ctrl+C to stop")
 
     while True:
         try:
             time_now = datetime.now().time()
-            alert_now = get_alert_now()
+            alert_now = get_alert_now(region)
 
             if alert_now is None:
-                alert_now = False  # Если API упало, считаем, что тревоги нет
+                alert_now = False
 
             if alarm_status(w_time, b_time, l_time, alert_now, time_now):
                 ring()
-                config['last_ring_date'] = today_str
+                config["last_ring_date"] = today_str
                 save_user_config(config)
                 break
 
@@ -175,18 +196,62 @@ def run_alarm(config):
             break
 
 
-def get_alert_now():
+def fetch_regions():
+    response = requests.get(alerts_url, timeout=5)
+    response.raise_for_status()
+
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Invalid API response")
+
+    states = payload.get("states")
+    if not isinstance(states, dict) or not states:
+        raise ValueError("Region list is missing")
+
+    return states
+
+
+def get_alert_now(region):
     try:
-        url = 'https://ubilling.net.ua/aerialalerts/'
-        response = requests.get(url, timeout=5)
-        res = response.json()
-        alert_now = res['states']['Одеська область']['alertnow']
+        alert_now = fetch_regions()[region]["alertnow"]
         if isinstance(alert_now, bool):
             return alert_now
-        return None
-    except (requests.RequestException, KeyError):
-        print("API unavailable (using default status: no alert)")
-        return None
+    except (requests.RequestException, ValueError, KeyError, TypeError):
+        pass
+
+    print("API unavailable (using default status: no alert)")
+    return None
+
+
+def choose_region(config):
+    try:
+        regions = sorted(fetch_regions())
+    except (requests.RequestException, ValueError):
+        print("Could not load the region list. Try again later.")
+        return
+
+    print("\nAvailable regions:")
+    for number, region in enumerate(regions, start=1):
+        print(f" {number}. {region}")
+    print(" 0. Back")
+
+    while True:
+        try:
+            choice = int(input("Choose a region: ").strip())
+        except ValueError:
+            print("Enter a number from the list.")
+            continue
+
+        if choice == 0:
+            return
+
+        if 1 <= choice <= len(regions):
+            config["region"] = regions[choice - 1]
+            save_user_config(config)
+            print(f"Region saved: {config['region']}")
+            return
+
+        print("Enter a number from the list.")
 
 
 def main():
@@ -195,12 +260,13 @@ def main():
     while True:
         print("\n   MENU   ")
         print(" 1. Set schedule")
-        print(" 2. Remove a day ")
+        print(" 2. Remove a day")
         print(" 3. Show schedule")
         print(" 4. Start alarm")
         print(" 5. Exit")
+        print(f" 6. Choose region (current: {config.get('region', default_region)})")
 
-        choice = input("Choose an option (1-5): ").strip()
+        choice = input("Choose an option (1-6): ").strip()
 
         if choice == "1":
             get_today_schedule(config)
@@ -213,8 +279,11 @@ def main():
         elif choice == "5":
             print("Exiting program...")
             break
+        elif choice == "6":
+            choose_region(config)
         else:
-            print("Invalid choice. Please choose from 1 to 5.")
+            print("Invalid choice. Please choose from 1 to 6.")
+
 
 if __name__ == "__main__":
     main()
